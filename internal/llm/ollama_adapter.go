@@ -259,8 +259,8 @@ func (o *OllamaAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan Token
 				}
 				req.Header.Set("User-Agent", "AgenticGoKit/1.0")
 
-				client := &http.Client{Timeout: 30 * time.Second}
-				resp, err := client.Do(req)
+				// PERFORMANCE: Reuse adapter's httpClient for connection pooling
+				resp, err := o.httpClient.Do(req)
 				if err != nil {
 					continue
 				}
