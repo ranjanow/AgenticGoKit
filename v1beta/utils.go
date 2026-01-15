@@ -2,6 +2,7 @@ package v1beta
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -491,6 +492,7 @@ func ValidateRAGConfig(config *RAGConfig) *RAGConfig {
 
 // ParseToolCalls extracts tool calls from LLM response content.
 // It supports multiple formats:
+//   - TOOL_CALL format: TOOL_CALL{"name":"divide","args":{"a":15,"b":27}}
 //   - JSON format: {"tool_calls": [{"name": "func", "arguments": {...}}]}
 //   - Function call format: function_name(arg1="value1", arg2="value2")
 //   - Action format: Action: function_name\nAction Input: {...}
@@ -499,7 +501,17 @@ func ValidateRAGConfig(config *RAGConfig) *RAGConfig {
 func ParseToolCalls(content string) []ToolCall {
 	var toolCalls []ToolCall
 
-	// Try JSON format first (most structured)
+	// Try TOOL_CALL format first (explicit pattern from reasoning models)
+	if calls := parseToolCallFormat(content); len(calls) > 0 {
+		return calls
+	}
+
+	// Try simple key/value format: tool_name: X \n args: {...}
+	if calls := parseToolNameArgsFormat(content); len(calls) > 0 {
+		return calls
+	}
+
+	// Try JSON format (most structured)
 	if calls := parseJSONToolCalls(content); len(calls) > 0 {
 		return calls
 	}
@@ -515,6 +527,144 @@ func ParseToolCalls(content string) []ToolCall {
 	}
 
 	return toolCalls
+}
+
+// parseToolCallFormat parses explicit TOOL_CALL{...} patterns
+// Example: TOOL_CALL{"name":"divide","args":{"a":15,"b":27}}
+func parseToolCallFormat(content string) []ToolCall {
+	var calls []ToolCall
+
+	// Split by TOOL_CALL marker
+	parts := strings.Split(content, "TOOL_CALL")
+	for i := 1; i < len(parts); i++ {
+		part := strings.TrimSpace(parts[i])
+
+		if !strings.HasPrefix(part, "{") {
+			continue
+		}
+
+		// Try to find a balanced JSON object first
+		braceCount := 0
+		endIndex := -1
+		for j, char := range part {
+			if char == '{' {
+				braceCount++
+			} else if char == '}' {
+				braceCount--
+				if braceCount == 0 {
+					endIndex = j
+					break
+				}
+			}
+		}
+
+		jsonStr := ""
+		if endIndex > 0 {
+			jsonStr = part[:endIndex+1]
+		} else {
+			// Fallback: salvage the current line, then balance braces by appending closes
+			jsonStr = part
+			if nl := strings.IndexAny(jsonStr, "\n\r"); nl >= 0 {
+				jsonStr = jsonStr[:nl]
+			}
+			jsonStr = strings.TrimSpace(jsonStr)
+
+			opens := strings.Count(jsonStr, "{")
+			closes := strings.Count(jsonStr, "}")
+			missing := opens - closes
+			if missing > 0 {
+				jsonStr += strings.Repeat("}", missing)
+			}
+		}
+
+		// Parse the JSON candidate
+		var data map[string]interface{}
+		if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
+			continue
+		}
+
+		// Extract name and args
+		if name, ok := data["name"].(string); ok {
+			var args map[string]interface{}
+
+			// Handle both "args" and "arguments" fields
+			if argsVal, ok := data["args"].(map[string]interface{}); ok {
+				args = argsVal
+			} else if argsVal, ok := data["arguments"].(map[string]interface{}); ok {
+				args = argsVal
+			}
+
+			if args == nil {
+				args = make(map[string]interface{})
+			}
+
+			calls = append(calls, ToolCall{
+				Name:      name,
+				Arguments: args,
+			})
+		}
+	}
+
+	return calls
+}
+
+// parseToolNameArgsFormat handles responses formatted as:
+// tool_name: weather\nargs: {"city":"Tokyo"}
+func parseToolNameArgsFormat(content string) []ToolCall {
+	var calls []ToolCall
+
+	lines := strings.Split(content, "\n")
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+
+		lower := strings.ToLower(line)
+		const prefix = "tool_name:"
+		if strings.HasPrefix(lower, prefix) {
+			name := strings.TrimSpace(line[len(prefix):])
+			if name == "" {
+				continue
+			}
+
+			args := make(map[string]interface{})
+
+			// Look ahead for args line
+			for j := i + 1; j < len(lines); j++ {
+				next := strings.TrimSpace(lines[j])
+				if next == "" {
+					continue
+				}
+
+				nextLower := strings.ToLower(next)
+				const argsPrefix = "args:"
+				if strings.HasPrefix(nextLower, argsPrefix) {
+					argStr := strings.TrimSpace(next[len(argsPrefix):])
+					if argStr != "" {
+						// Try JSON first
+						if err := json.Unmarshal([]byte(argStr), &args); err != nil {
+							args = parseSimpleJSON(argStr)
+						}
+					}
+
+					i = j // Advance outer loop past args line
+				}
+
+				// Stop scanning once we hit a non-args, non-empty line
+				if !strings.HasPrefix(nextLower, argsPrefix) {
+					break
+				}
+			}
+
+			calls = append(calls, ToolCall{
+				Name:      name,
+				Arguments: args,
+			})
+		}
+	}
+
+	return calls
 }
 
 // parseJSONToolCalls attempts to parse JSON-formatted tool calls
@@ -570,7 +720,9 @@ func parseFunctionStyleCalls(content string) []ToolCall {
 }
 
 // parseActionStyleCalls parses ReAct-style action format
-// Example: Action: search\nAction Input: {"query": "weather"}
+// Handles both:
+// - Classic ReAct: Action: search\nAction Input: {"query": "weather"}
+// - Simplified: Action: weather\nInput: {"city": "Tokyo"}
 func parseActionStyleCalls(content string) []ToolCall {
 	var calls []ToolCall
 
@@ -580,13 +732,34 @@ func parseActionStyleCalls(content string) []ToolCall {
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
 
-		if strings.HasPrefix(strings.ToLower(line), "action:") {
+		lower := strings.ToLower(line)
+
+		// Match "action:" or "action: " (case-insensitive)
+		if strings.HasPrefix(lower, "action:") {
 			currentAction = strings.TrimSpace(line[7:]) // Remove "Action:"
-		} else if strings.HasPrefix(strings.ToLower(line), "action input:") {
+		} else if strings.HasPrefix(lower, "input:") {
+			// Match "input:" (for simplified format)
+			currentInput = strings.TrimSpace(line[6:]) // Remove "Input:"
+
+			// If we have action and input, create a tool call
+			if currentAction != "" {
+				args := parseSimpleJSON(currentInput)
+				calls = append(calls, ToolCall{
+					Name:      currentAction,
+					Arguments: args,
+				})
+				currentAction = ""
+				currentInput = ""
+			}
+		} else if strings.HasPrefix(lower, "action input:") {
+			// Match "action input:" (for classic ReAct format)
 			currentInput = strings.TrimSpace(line[13:]) // Remove "Action Input:"
 
-			// If we have both action and input, create a tool call
+			// If we have action and input, create a tool call
 			if currentAction != "" {
 				args := parseSimpleJSON(currentInput)
 				calls = append(calls, ToolCall{

@@ -282,13 +282,26 @@ func (a *realAgent) execute(ctx context.Context, input string, opts *RunOptions)
 
 	// Step 1.5: Add tool definitions (native) and descriptions (text fallback)
 	if len(a.tools) > 0 {
-		prompt.Tools = convertToolsToLLMFormat(a.tools)
+		// Check if reasoning is enabled - if so, only use text descriptions, not native tools
+		reasoningEnabled := a.config.Tools != nil &&
+			a.config.Tools.Reasoning != nil &&
+			a.config.Tools.Reasoning.Enabled
+
+		// Only pass native tools if reasoning is NOT enabled
+		// When reasoning is enabled, we rely on explicit TOOL_CALL patterns instead
+		if !reasoningEnabled {
+			prompt.Tools = convertToolsToLLMFormat(a.tools)
+		}
+
+		// Always add text descriptions for reference (works with all models)
 		toolDescriptions := FormatToolsForPrompt(a.tools)
 		prompt.System = prompt.System + toolDescriptions
 
 		Logger().Debug().
 			Int("tool_count", len(a.tools)).
-			Msg("Added tool definitions to prompt")
+			Bool("reasoning_enabled", reasoningEnabled).
+			Bool("native_tools_passed", !reasoningEnabled).
+			Msg("Added tool information to prompt")
 	}
 
 	// Add model parameters from config if specified
@@ -1292,7 +1305,7 @@ func (a *realAgent) executeToolsAndContinue(
 		continuationPrompt := llm.Prompt{
 			System: originalPrompt.System,
 			User: fmt.Sprintf(
-				"Previous response:\n%s\n\nTool execution results:\n%s\n\nPlease continue with your response based on the tool results.",
+				"Previous response:\n%s\n\nTool execution results:\n%s\n\nBased on these tool results, provide a final answer. Do NOT make additional tool calls unless absolutely necessary.",
 				currentResponse,
 				toolResults.String(),
 			),
@@ -1409,12 +1422,17 @@ func (a *realAgent) executeNativeToolsAndContinue(
 		continuationPrompt := llm.Prompt{
 			System: originalPrompt.System,
 			User: fmt.Sprintf(
-				"Previous response:\n%s\n\nTool execution results:\n%s\n\nPlease continue with your response based on the tool results.",
+				"Previous response:\n%s\n\nTool execution results:\n%s\n\nBased on these tool results, provide a final answer. Do NOT make additional tool calls unless absolutely necessary.",
 				currentResponse,
 				toolResults.String(),
 			),
 			Parameters: originalPrompt.Parameters,
-			Tools:      originalPrompt.Tools,
+		}
+
+		// Only pass native tools if the model supports them and we're not relying on reasoning
+		// When reasoning is enabled, we parse TOOL_CALL patterns instead of native tools
+		if a.config.Tools == nil || a.config.Tools.Reasoning == nil || !a.config.Tools.Reasoning.Enabled {
+			continuationPrompt.Tools = originalPrompt.Tools
 		}
 
 		resp, err := a.llmProvider.Call(ctx, continuationPrompt)

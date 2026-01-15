@@ -212,12 +212,12 @@ func (e *echoTool) Execute(ctx context.Context, args map[string]interface{}) (*T
 }
 
 // Register the echo tool on package initialization
+// DISABLED: This example tool can interfere with production usage
+// Users can re-enable by uncommenting this block
+/*
 func init() {
 	RegisterInternalTool("echo", func() Tool {
 		return &echoTool{}
 	})
 }
-
-
-
-
+*/
