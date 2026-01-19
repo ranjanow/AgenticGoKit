@@ -11,6 +11,11 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/agenticgokit/agenticgokit/internal/observability"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 // DefaultOpenAIBaseURL is the default OpenAI API endpoint
@@ -151,18 +156,39 @@ func (o *OpenAIAdapter) getBaseURL() string {
 
 // Call implements the ModelProvider interface for a single request/response.
 func (o *OpenAIAdapter) Call(ctx context.Context, prompt Prompt) (Response, error) {
+	// Create observability span
+	tracer := otel.Tracer("agenticgokit.llm")
+	ctx, span := tracer.Start(ctx, "llm.openai.call")
+	defer span.End()
+
+	// Set span attributes
+	span.SetAttributes(
+		attribute.String(observability.AttrLLMProvider, "openai"),
+		attribute.String(observability.AttrLLMModel, o.model),
+		attribute.Int(observability.AttrLLMMaxTokens, o.maxTokens),
+		attribute.Float64(observability.AttrLLMTemperature, float64(o.temperature)),
+	)
+
+	// Track start time for latency
+	startTime := time.Now()
+
 	userPrompt := prompt.User
 	if userPrompt == "" {
-		return Response{}, errors.New("user prompt cannot be empty")
+		err := errors.New("user prompt cannot be empty")
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "empty user prompt")
+		return Response{}, err
 	}
 
 	maxTokens := o.maxTokens
 	if prompt.Parameters.MaxTokens != nil {
 		maxTokens = int(*prompt.Parameters.MaxTokens)
+		span.SetAttributes(attribute.Int(observability.AttrLLMMaxTokens, maxTokens))
 	}
 	temperature := o.temperature
 	if prompt.Parameters.Temperature != nil {
 		temperature = *prompt.Parameters.Temperature
+		span.SetAttributes(attribute.Float64(observability.AttrLLMTemperature, float64(temperature)))
 	}
 
 	// Build messages array for Chat Completions API
@@ -181,6 +207,8 @@ func (o *OpenAIAdapter) Call(ctx context.Context, prompt Prompt) (Response, erro
 	if len(prompt.Images) > 0 {
 		// Multimodal content
 		userContent = BuildMultimodalContent(userPrompt, prompt)
+		span.SetAttributes(attribute.Bool("llm.multimodal", true))
+		span.SetAttributes(attribute.Int("llm.image_count", len(prompt.Images)))
 	} else {
 		// Text-only content
 		userContent = userPrompt
@@ -221,24 +249,36 @@ func (o *OpenAIAdapter) Call(ctx context.Context, prompt Prompt) (Response, erro
 
 	requestBody, err := json.Marshal(reqBody)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to marshal request")
 		return Response{}, err
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", o.getBaseURL()+"/chat/completions", bytes.NewBuffer(requestBody))
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to create HTTP request")
 		return Response{}, err
 	}
 	o.setHeaders(req)
 
 	resp, err := o.httpClient.Do(req)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "HTTP request failed")
 		return Response{}, err
 	}
 	defer resp.Body.Close()
 
+	// Record HTTP status
+	span.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return Response{}, errors.New("OpenAI API error: " + string(body))
+		err := errors.New("OpenAI API error: " + string(body))
+		span.RecordError(err)
+		span.SetStatus(codes.Error, fmt.Sprintf("API error: status %d", resp.StatusCode))
+		return Response{}, err
 	}
 
 	var response struct {
@@ -255,12 +295,31 @@ func (o *OpenAIAdapter) Call(ctx context.Context, prompt Prompt) (Response, erro
 		} `json:"usage"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to decode response")
 		return Response{}, err
 	}
 
 	if len(response.Choices) == 0 {
-		return Response{}, errors.New("no completion choices returned")
+		err := errors.New("no completion choices returned")
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "no choices in response")
+		return Response{}, err
 	}
+
+	// Calculate latency
+	latencyMs := time.Since(startTime).Milliseconds()
+
+	// Record token usage and latency
+	span.SetAttributes(
+		attribute.Int(observability.AttrLLMPromptTokens, response.Usage.PromptTokens),
+		attribute.Int(observability.AttrLLMCompletionTokens, response.Usage.CompletionTokens),
+		attribute.Int(observability.AttrLLMTotalTokens, response.Usage.TotalTokens),
+		attribute.Int64("llm.latency_ms", latencyMs),
+		attribute.String("llm.finish_reason", response.Choices[0].FinishReason),
+	)
+
+	span.SetStatus(codes.Ok, "LLM call successful")
 
 	return Response{
 		Content: response.Choices[0].Message.Content,
@@ -275,18 +334,40 @@ func (o *OpenAIAdapter) Call(ctx context.Context, prompt Prompt) (Response, erro
 
 // Stream implements the ModelProvider interface for streaming responses.
 func (o *OpenAIAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan Token, error) {
+	// Create observability span
+	tracer := otel.Tracer("agenticgokit.llm")
+	ctx, span := tracer.Start(ctx, "llm.openai.stream")
+	defer span.End()
+
+	// Set span attributes
+	span.SetAttributes(
+		attribute.String(observability.AttrLLMProvider, "openai"),
+		attribute.String(observability.AttrLLMModel, o.model),
+		attribute.Int(observability.AttrLLMMaxTokens, o.maxTokens),
+		attribute.Float64(observability.AttrLLMTemperature, float64(o.temperature)),
+		attribute.Bool("llm.streaming", true),
+	)
+
+	// Track start time for latency
+	startTime := time.Now()
+
 	userPrompt := prompt.User
 	if userPrompt == "" {
-		return nil, errors.New("user prompt cannot be empty")
+		err := errors.New("user prompt cannot be empty")
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "empty user prompt")
+		return nil, err
 	}
 
 	maxTokens := o.maxTokens
 	if prompt.Parameters.MaxTokens != nil {
 		maxTokens = int(*prompt.Parameters.MaxTokens)
+		span.SetAttributes(attribute.Int(observability.AttrLLMMaxTokens, maxTokens))
 	}
 	temperature := o.temperature
 	if prompt.Parameters.Temperature != nil {
 		temperature = *prompt.Parameters.Temperature
+		span.SetAttributes(attribute.Float64(observability.AttrLLMTemperature, float64(temperature)))
 	}
 
 	// Build messages array for Chat Completions API
@@ -305,6 +386,8 @@ func (o *OpenAIAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan Token
 	if len(prompt.Images) > 0 {
 		// Multimodal content
 		userContent = BuildMultimodalContent(userPrompt, prompt)
+		span.SetAttributes(attribute.Bool("llm.multimodal", true))
+		span.SetAttributes(attribute.Int("llm.image_count", len(prompt.Images)))
 	} else {
 		// Text-only content
 		userContent = userPrompt
@@ -346,12 +429,16 @@ func (o *OpenAIAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan Token
 
 	requestBody, err := json.Marshal(reqBody)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to marshal request")
 		return nil, fmt.Errorf("failed to marshal request payload: %w", err)
 	}
 
 	// Create HTTP request for streaming
 	req, err := http.NewRequestWithContext(ctx, "POST", o.getBaseURL()+"/chat/completions", bytes.NewBuffer(requestBody))
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to create HTTP request")
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 	o.setHeaders(req)
@@ -359,13 +446,21 @@ func (o *OpenAIAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan Token
 	// Make the request
 	resp, err := o.httpClient.Do(req)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "HTTP request failed")
 		return nil, fmt.Errorf("failed to make request: %w", err)
 	}
+
+	// Record HTTP status
+	span.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
 
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API error: %d - %s", resp.StatusCode, string(body))
+		err := fmt.Errorf("API error: %d - %s", resp.StatusCode, string(body))
+		span.RecordError(err)
+		span.SetStatus(codes.Error, fmt.Sprintf("API error: status %d", resp.StatusCode))
+		return nil, err
 	}
 
 	// Create token channel
@@ -375,6 +470,10 @@ func (o *OpenAIAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan Token
 	go func() {
 		defer close(tokenChan)
 		defer resp.Body.Close()
+
+		// Track chunks and total bytes
+		chunkCount := 0
+		totalBytes := 0
 
 		scanner := bufio.NewScanner(resp.Body)
 		for scanner.Scan() {
@@ -387,6 +486,8 @@ func (o *OpenAIAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan Token
 			select {
 			case <-ctx.Done():
 				tokenChan <- Token{Error: ctx.Err()}
+				span.RecordError(ctx.Err())
+				span.SetStatus(codes.Error, "context canceled during stream")
 				return
 			default:
 			}
@@ -395,6 +496,14 @@ func (o *OpenAIAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan Token
 			if strings.HasPrefix(line, "data: ") {
 				data := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
 				if data == "[DONE]" {
+					// Record final metrics
+					latencyMs := time.Since(startTime).Milliseconds()
+					span.SetAttributes(
+						attribute.Int("llm.stream.chunk_count", chunkCount),
+						attribute.Int("llm.stream.total_bytes", totalBytes),
+						attribute.Int64("llm.latency_ms", latencyMs),
+					)
+					span.SetStatus(codes.Ok, "stream completed successfully")
 					return // Stream finished successfully
 				}
 
@@ -410,6 +519,8 @@ func (o *OpenAIAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan Token
 
 				if err := json.Unmarshal([]byte(data), &streamResponse); err != nil {
 					tokenChan <- Token{Error: fmt.Errorf("failed to decode stream chunk: %w", err)}
+					span.RecordError(err)
+					span.SetStatus(codes.Error, "failed to decode stream chunk")
 					return
 				}
 
@@ -417,10 +528,14 @@ func (o *OpenAIAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan Token
 				if len(streamResponse.Choices) > 0 {
 					content := streamResponse.Choices[0].Delta.Content
 					if content != "" {
+						chunkCount++
+						totalBytes += len(content)
 						select {
 						case tokenChan <- Token{Content: content}:
 						case <-ctx.Done():
 							tokenChan <- Token{Error: ctx.Err()}
+							span.RecordError(ctx.Err())
+							span.SetStatus(codes.Error, "context canceled during send")
 							return
 						}
 					}
@@ -432,6 +547,8 @@ func (o *OpenAIAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan Token
 		if err := scanner.Err(); err != nil {
 			if ctx.Err() == nil {
 				tokenChan <- Token{Error: fmt.Errorf("stream read error: %w", err)}
+				span.RecordError(err)
+				span.SetStatus(codes.Error, "stream read error")
 			}
 		}
 	}()

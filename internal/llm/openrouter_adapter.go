@@ -11,6 +11,11 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/agenticgokit/agenticgokit/internal/observability"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 // OpenRouterAdapter implements the ModelProvider interface for OpenRouter's API.
@@ -90,18 +95,49 @@ func buildOpenRouterMessages(prompt Prompt) []map[string]interface{} {
 
 // Call implements the ModelProvider interface for a single request/response.
 func (o *OpenRouterAdapter) Call(ctx context.Context, prompt Prompt) (Response, error) {
+	// Create observability span
+	tracer := otel.Tracer("agenticgokit.llm")
+	ctx, span := tracer.Start(ctx, "llm.openrouter.call")
+	defer span.End()
+
+	// Set span attributes
+	span.SetAttributes(
+		attribute.String(observability.AttrLLMProvider, "openrouter"),
+		attribute.String(observability.AttrLLMModel, o.model),
+	)
+
+	// Track start time for latency
+	startTime := time.Now()
+
 	userPrompt := prompt.User
 	if userPrompt == "" {
-		return Response{}, errors.New("user prompt cannot be empty")
+		err := errors.New("user prompt cannot be empty")
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "empty user prompt")
+		return Response{}, err
 	}
 
 	maxTokens := o.maxTokens
 	if prompt.Parameters.MaxTokens != nil {
 		maxTokens = int(*prompt.Parameters.MaxTokens)
+		span.SetAttributes(attribute.Int(observability.AttrLLMMaxTokens, maxTokens))
+	} else {
+		span.SetAttributes(attribute.Int(observability.AttrLLMMaxTokens, o.maxTokens))
 	}
 	temperature := o.temperature
 	if prompt.Parameters.Temperature != nil {
 		temperature = *prompt.Parameters.Temperature
+		span.SetAttributes(attribute.Float64(observability.AttrLLMTemperature, float64(temperature)))
+	} else {
+		span.SetAttributes(attribute.Float64(observability.AttrLLMTemperature, float64(o.temperature)))
+	}
+
+	// Track multimodal content
+	if len(prompt.Images) > 0 || len(prompt.Audio) > 0 || len(prompt.Video) > 0 {
+		span.SetAttributes(attribute.Bool("llm.multimodal", true))
+		if len(prompt.Images) > 0 {
+			span.SetAttributes(attribute.Int("llm.image_count", len(prompt.Images)))
+		}
 	}
 
 	// Build messages array for Chat Completions API
@@ -114,11 +150,15 @@ func (o *OpenRouterAdapter) Call(ctx context.Context, prompt Prompt) (Response, 
 		"temperature": temperature,
 	})
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to marshal request")
 		return Response{}, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", o.baseURL+"/chat/completions", bytes.NewBuffer(requestBody))
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to create HTTP request")
 		return Response{}, fmt.Errorf("failed to create request: %w", err)
 	}
 
@@ -136,9 +176,14 @@ func (o *OpenRouterAdapter) Call(ctx context.Context, prompt Prompt) (Response, 
 
 	resp, err := o.httpClient.Do(req)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "HTTP request failed")
 		return Response{}, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
+
+	// Record HTTP status
+	span.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -153,10 +198,16 @@ func (o *OpenRouterAdapter) Call(ctx context.Context, prompt Prompt) (Response, 
 		}
 
 		if json.Unmarshal(body, &errorResp) == nil && errorResp.Error.Message != "" {
-			return Response{}, fmt.Errorf("OpenRouter API error [%s]: %s", errorResp.Error.Code, errorResp.Error.Message)
+			err := fmt.Errorf("OpenRouter API error [%s]: %s", errorResp.Error.Code, errorResp.Error.Message)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, fmt.Sprintf("API error: %s", errorResp.Error.Code))
+			return Response{}, err
 		}
 
-		return Response{}, fmt.Errorf("OpenRouter API error: %d - %s", resp.StatusCode, string(body))
+		err := fmt.Errorf("OpenRouter API error: %d - %s", resp.StatusCode, string(body))
+		span.RecordError(err)
+		span.SetStatus(codes.Error, fmt.Sprintf("API error: status %d", resp.StatusCode))
+		return Response{}, err
 	}
 
 	var response struct {
@@ -173,12 +224,31 @@ func (o *OpenRouterAdapter) Call(ctx context.Context, prompt Prompt) (Response, 
 		} `json:"usage"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to decode response")
 		return Response{}, fmt.Errorf("failed to decode response: %w", err)
 	}
 
 	if len(response.Choices) == 0 {
-		return Response{}, errors.New("no completion choices returned")
+		err := errors.New("no completion choices returned")
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "no choices in response")
+		return Response{}, err
 	}
+
+	// Calculate latency
+	latencyMs := time.Since(startTime).Milliseconds()
+
+	// Record token usage and latency
+	span.SetAttributes(
+		attribute.Int(observability.AttrLLMPromptTokens, response.Usage.PromptTokens),
+		attribute.Int(observability.AttrLLMCompletionTokens, response.Usage.CompletionTokens),
+		attribute.Int(observability.AttrLLMTotalTokens, response.Usage.TotalTokens),
+		attribute.Int64("llm.latency_ms", latencyMs),
+		attribute.String("llm.finish_reason", response.Choices[0].FinishReason),
+	)
+
+	span.SetStatus(codes.Ok, "LLM call successful")
 
 	return Response{
 		Content: response.Choices[0].Message.Content,
@@ -193,18 +263,50 @@ func (o *OpenRouterAdapter) Call(ctx context.Context, prompt Prompt) (Response, 
 
 // Stream implements the ModelProvider interface for streaming responses.
 func (o *OpenRouterAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan Token, error) {
+	// Create observability span
+	tracer := otel.Tracer("agenticgokit.llm")
+	ctx, span := tracer.Start(ctx, "llm.openrouter.stream")
+	defer span.End()
+
+	// Set span attributes
+	span.SetAttributes(
+		attribute.String(observability.AttrLLMProvider, "openrouter"),
+		attribute.String(observability.AttrLLMModel, o.model),
+		attribute.Bool("llm.streaming", true),
+	)
+
+	// Track start time for latency
+	startTime := time.Now()
+
 	userPrompt := prompt.User
 	if userPrompt == "" {
-		return nil, errors.New("user prompt cannot be empty")
+		err := errors.New("user prompt cannot be empty")
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "empty user prompt")
+		return nil, err
 	}
 
 	maxTokens := o.maxTokens
 	if prompt.Parameters.MaxTokens != nil {
 		maxTokens = int(*prompt.Parameters.MaxTokens)
+		span.SetAttributes(attribute.Int(observability.AttrLLMMaxTokens, maxTokens))
+	} else {
+		span.SetAttributes(attribute.Int(observability.AttrLLMMaxTokens, o.maxTokens))
 	}
 	temperature := o.temperature
 	if prompt.Parameters.Temperature != nil {
 		temperature = *prompt.Parameters.Temperature
+		span.SetAttributes(attribute.Float64(observability.AttrLLMTemperature, float64(temperature)))
+	} else {
+		span.SetAttributes(attribute.Float64(observability.AttrLLMTemperature, float64(o.temperature)))
+	}
+
+	// Track multimodal content
+	if len(prompt.Images) > 0 || len(prompt.Audio) > 0 || len(prompt.Video) > 0 {
+		span.SetAttributes(attribute.Bool("llm.multimodal", true))
+		if len(prompt.Images) > 0 {
+			span.SetAttributes(attribute.Int("llm.image_count", len(prompt.Images)))
+		}
 	}
 
 	// Build messages array for Chat Completions API
@@ -219,12 +321,16 @@ func (o *OpenRouterAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan T
 		"stream":      true, // Enable streaming
 	})
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to marshal request")
 		return nil, fmt.Errorf("failed to marshal request payload: %w", err)
 	}
 
 	// Create HTTP request for streaming
 	req, err := http.NewRequestWithContext(ctx, "POST", o.baseURL+"/chat/completions", bytes.NewBuffer(requestBody))
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to create HTTP request")
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
@@ -243,8 +349,13 @@ func (o *OpenRouterAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan T
 	// Make the request
 	resp, err := o.httpClient.Do(req)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "HTTP request failed")
 		return nil, fmt.Errorf("failed to make request: %w", err)
 	}
+
+	// Record HTTP status
+	span.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
 
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
@@ -260,10 +371,16 @@ func (o *OpenRouterAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan T
 		}
 
 		if json.Unmarshal(body, &errorResp) == nil && errorResp.Error.Message != "" {
-			return nil, fmt.Errorf("OpenRouter API error [%s]: %s", errorResp.Error.Code, errorResp.Error.Message)
+			err := fmt.Errorf("OpenRouter API error [%s]: %s", errorResp.Error.Code, errorResp.Error.Message)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, fmt.Sprintf("API error: %s", errorResp.Error.Code))
+			return nil, err
 		}
 
-		return nil, fmt.Errorf("OpenRouter API error: %d - %s", resp.StatusCode, string(body))
+		err := fmt.Errorf("OpenRouter API error: %d - %s", resp.StatusCode, string(body))
+		span.RecordError(err)
+		span.SetStatus(codes.Error, fmt.Sprintf("API error: status %d", resp.StatusCode))
+		return nil, err
 	}
 
 	// Create token channel
@@ -273,6 +390,9 @@ func (o *OpenRouterAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan T
 	go func() {
 		defer close(tokenChan)
 		defer resp.Body.Close()
+
+		var chunkCount int
+		var totalBytes int64
 
 		scanner := bufio.NewScanner(resp.Body)
 		for scanner.Scan() {
@@ -284,6 +404,8 @@ func (o *OpenRouterAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan T
 			// Check for context cancellation
 			select {
 			case <-ctx.Done():
+				span.RecordError(ctx.Err())
+				span.SetStatus(codes.Error, "context cancelled")
 				tokenChan <- Token{Error: ctx.Err()}
 				return
 			default:
@@ -293,6 +415,14 @@ func (o *OpenRouterAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan T
 			if strings.HasPrefix(line, "data: ") {
 				data := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
 				if data == "[DONE]" {
+					// Calculate final metrics
+					latencyMs := time.Since(startTime).Milliseconds()
+					span.SetAttributes(
+						attribute.Int("llm.chunk_count", chunkCount),
+						attribute.Int64("llm.total_bytes", totalBytes),
+						attribute.Int64("llm.latency_ms", latencyMs),
+					)
+					span.SetStatus(codes.Ok, "stream completed")
 					return // Stream finished successfully
 				}
 
@@ -307,6 +437,8 @@ func (o *OpenRouterAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan T
 				}
 
 				if err := json.Unmarshal([]byte(data), &streamResponse); err != nil {
+					span.RecordError(err)
+					span.SetStatus(codes.Error, "failed to decode chunk")
 					tokenChan <- Token{Error: fmt.Errorf("failed to decode stream chunk: %w", err)}
 					return
 				}
@@ -315,9 +447,14 @@ func (o *OpenRouterAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan T
 				if len(streamResponse.Choices) > 0 {
 					content := streamResponse.Choices[0].Delta.Content
 					if content != "" {
+						chunkCount++
+						totalBytes += int64(len(content))
+
 						select {
 						case tokenChan <- Token{Content: content}:
 						case <-ctx.Done():
+							span.RecordError(ctx.Err())
+							span.SetStatus(codes.Error, "context cancelled during streaming")
 							tokenChan <- Token{Error: ctx.Err()}
 							return
 						}
@@ -329,6 +466,8 @@ func (o *OpenRouterAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan T
 		// Check for scanner errors
 		if err := scanner.Err(); err != nil {
 			if ctx.Err() == nil {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, "stream read error")
 				tokenChan <- Token{Error: fmt.Errorf("stream read error: %w", err)}
 			}
 		}

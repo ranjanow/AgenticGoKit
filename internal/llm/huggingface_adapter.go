@@ -11,6 +11,12 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/agenticgokit/agenticgokit/internal/observability"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 // HuggingFaceAdapter implements the ModelProvider interface for Hugging Face APIs.
@@ -235,19 +241,51 @@ func (h *HuggingFaceAdapter) buildChatRequest(prompt Prompt, maxTokens int, temp
 
 // Call implements the ModelProvider interface for synchronous requests
 func (h *HuggingFaceAdapter) Call(ctx context.Context, prompt Prompt) (Response, error) {
+	// Create observability span
+	tracer := otel.Tracer("agenticgokit.llm")
+	ctx, span := tracer.Start(ctx, "llm.huggingface.call")
+	defer span.End()
+
+	// Set span attributes
+	span.SetAttributes(
+		attribute.String(observability.AttrLLMProvider, "huggingface"),
+		attribute.String(observability.AttrLLMModel, h.model),
+		attribute.String("llm.api_type", string(h.apiType)),
+	)
+
+	// Track start time for latency
+	startTime := time.Now()
+
 	userPrompt := prompt.User
 	if userPrompt == "" {
-		return Response{}, errors.New("user prompt cannot be empty")
+		err := errors.New("user prompt cannot be empty")
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "empty user prompt")
+		return Response{}, err
 	}
 
 	// Get parameters with overrides
 	maxTokens := h.maxTokens
 	if prompt.Parameters.MaxTokens != nil {
 		maxTokens = int(*prompt.Parameters.MaxTokens)
+		span.SetAttributes(attribute.Int(observability.AttrLLMMaxTokens, maxTokens))
+	} else {
+		span.SetAttributes(attribute.Int(observability.AttrLLMMaxTokens, h.maxTokens))
 	}
 	temperature := h.temperature
 	if prompt.Parameters.Temperature != nil {
 		temperature = *prompt.Parameters.Temperature
+		span.SetAttributes(attribute.Float64(observability.AttrLLMTemperature, float64(temperature)))
+	} else {
+		span.SetAttributes(attribute.Float64(observability.AttrLLMTemperature, float64(h.temperature)))
+	}
+
+	// Track multimodal content
+	if len(prompt.Images) > 0 || len(prompt.Audio) > 0 || len(prompt.Video) > 0 {
+		span.SetAttributes(attribute.Bool("llm.multimodal", true))
+		if len(prompt.Images) > 0 {
+			span.SetAttributes(attribute.Int("llm.image_count", len(prompt.Images)))
+		}
 	}
 
 	// Build request based on API type
@@ -259,12 +297,17 @@ func (h *HuggingFaceAdapter) Call(ctx context.Context, prompt Prompt) (Response,
 	case HFAPITypeEndpoint, HFAPITypeTGI:
 		requestBody = h.buildInferenceRequest(prompt, maxTokens, temperature, false)
 	default:
-		return Response{}, fmt.Errorf("unsupported API type: %s", h.apiType)
+		err := fmt.Errorf("unsupported API type: %s", h.apiType)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "unsupported API type")
+		return Response{}, err
 	}
 
 	// Marshal request
 	requestBytes, err := json.Marshal(requestBody)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to marshal request")
 		return Response{}, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
@@ -274,6 +317,8 @@ func (h *HuggingFaceAdapter) Call(ctx context.Context, prompt Prompt) (Response,
 	// Create HTTP request
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(requestBytes))
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to create HTTP request")
 		return Response{}, fmt.Errorf("failed to create request: %w", err)
 	}
 
@@ -289,6 +334,8 @@ func (h *HuggingFaceAdapter) Call(ctx context.Context, prompt Prompt) (Response,
 	for i := 0; i < maxRetries; i++ {
 		resp, err = h.httpClient.Do(req)
 		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "HTTP request failed")
 			return Response{}, fmt.Errorf("request failed: %w", err)
 		}
 
@@ -305,44 +352,113 @@ func (h *HuggingFaceAdapter) Call(ctx context.Context, prompt Prompt) (Response,
 	}
 	defer resp.Body.Close()
 
+	// Record HTTP status
+	span.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
+
 	// Read response body
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to read response")
 		return Response{}, fmt.Errorf("failed to read response: %w", err)
 	}
 
 	// Check status code
 	if resp.StatusCode != http.StatusOK {
-		return Response{}, h.parseError(resp.StatusCode, body)
+		err := h.parseError(resp.StatusCode, body)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, fmt.Sprintf("API error: status %d", resp.StatusCode))
+		return Response{}, err
 	}
 
+	// Calculate latency
+	latencyMs := time.Since(startTime).Milliseconds()
+
 	// Parse response based on API type
+	var result Response
 	switch h.apiType {
 	case HFAPITypeChat, HFAPITypeInference:
 		// Both use the OpenAI-compatible chat completions format
-		return h.parseChatResponse(body)
+		result, err = h.parseChatResponse(body)
 	case HFAPITypeEndpoint, HFAPITypeTGI:
-		return h.parseInferenceResponse(body)
+		result, err = h.parseInferenceResponse(body)
 	default:
-		return Response{}, fmt.Errorf("unsupported API type: %s", h.apiType)
+		err = fmt.Errorf("unsupported API type: %s", h.apiType)
 	}
+
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to parse response")
+		return Response{}, err
+	}
+
+	// Record token usage and latency (if available)
+	if result.Usage.TotalTokens > 0 {
+		span.SetAttributes(
+			attribute.Int(observability.AttrLLMPromptTokens, result.Usage.PromptTokens),
+			attribute.Int(observability.AttrLLMCompletionTokens, result.Usage.CompletionTokens),
+			attribute.Int(observability.AttrLLMTotalTokens, result.Usage.TotalTokens),
+			attribute.String("llm.usage_api_type", string(h.apiType)),
+		)
+	}
+	span.SetAttributes(
+		attribute.Int64("llm.latency_ms", latencyMs),
+		attribute.String("llm.finish_reason", result.FinishReason),
+	)
+
+	span.SetStatus(codes.Ok, "LLM call successful")
+
+	return result, nil
 }
 
 // Stream implements the ModelProvider interface for streaming requests
 func (h *HuggingFaceAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan Token, error) {
+	// Create observability span
+	tracer := otel.Tracer("agenticgokit.llm")
+	ctx, span := tracer.Start(ctx, "llm.huggingface.stream")
+	defer span.End()
+
+	// Set span attributes
+	span.SetAttributes(
+		attribute.String(observability.AttrLLMProvider, "huggingface"),
+		attribute.String(observability.AttrLLMModel, h.model),
+		attribute.String("llm.api_type", string(h.apiType)),
+		attribute.Bool("llm.streaming", true),
+	)
+
+	// Track start time for latency
+	startTime := time.Now()
+
 	userPrompt := prompt.User
 	if userPrompt == "" {
-		return nil, errors.New("user prompt cannot be empty")
+		err := errors.New("user prompt cannot be empty")
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "empty user prompt")
+		return nil, err
 	}
 
 	// Get parameters with overrides
 	maxTokens := h.maxTokens
 	if prompt.Parameters.MaxTokens != nil {
 		maxTokens = int(*prompt.Parameters.MaxTokens)
+		span.SetAttributes(attribute.Int(observability.AttrLLMMaxTokens, maxTokens))
+	} else {
+		span.SetAttributes(attribute.Int(observability.AttrLLMMaxTokens, h.maxTokens))
 	}
 	temperature := h.temperature
 	if prompt.Parameters.Temperature != nil {
 		temperature = *prompt.Parameters.Temperature
+		span.SetAttributes(attribute.Float64(observability.AttrLLMTemperature, float64(temperature)))
+	} else {
+		span.SetAttributes(attribute.Float64(observability.AttrLLMTemperature, float64(h.temperature)))
+	}
+
+	// Track multimodal content
+	if len(prompt.Images) > 0 || len(prompt.Audio) > 0 || len(prompt.Video) > 0 {
+		span.SetAttributes(attribute.Bool("llm.multimodal", true))
+		if len(prompt.Images) > 0 {
+			span.SetAttributes(attribute.Int("llm.image_count", len(prompt.Images)))
+		}
 	}
 
 	// Build request based on API type
@@ -354,12 +470,17 @@ func (h *HuggingFaceAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan 
 	case HFAPITypeEndpoint, HFAPITypeTGI:
 		requestBody = h.buildInferenceRequest(prompt, maxTokens, temperature, true)
 	default:
-		return nil, fmt.Errorf("unsupported API type: %s", h.apiType)
+		err := fmt.Errorf("unsupported API type: %s", h.apiType)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "unsupported API type")
+		return nil, err
 	}
 
 	// Marshal request
 	requestBytes, err := json.Marshal(requestBody)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to marshal request")
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
@@ -369,6 +490,8 @@ func (h *HuggingFaceAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan 
 	// Create HTTP request
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(requestBytes))
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to create HTTP request")
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
@@ -381,14 +504,22 @@ func (h *HuggingFaceAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan 
 	// Make request
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "HTTP request failed")
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
+
+	// Record HTTP status
+	span.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
 
 	// Check status code
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		return nil, h.parseError(resp.StatusCode, body)
+		err := h.parseError(resp.StatusCode, body)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, fmt.Sprintf("API error: status %d", resp.StatusCode))
+		return nil, err
 	}
 
 	// Create token channel
@@ -398,6 +529,9 @@ func (h *HuggingFaceAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan 
 	go func() {
 		defer close(tokenChan)
 		defer resp.Body.Close()
+
+		var chunkCount int
+		var totalBytes int64
 
 		scanner := bufio.NewScanner(resp.Body)
 		for scanner.Scan() {
@@ -409,6 +543,8 @@ func (h *HuggingFaceAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan 
 			// Check for context cancellation
 			select {
 			case <-ctx.Done():
+				span.RecordError(ctx.Err())
+				span.SetStatus(codes.Error, "context cancelled")
 				tokenChan <- Token{Error: ctx.Err()}
 				return
 			default:
@@ -418,6 +554,14 @@ func (h *HuggingFaceAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan 
 			if strings.HasPrefix(line, "data: ") {
 				data := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
 				if data == "[DONE]" {
+					// Calculate final metrics
+					latencyMs := time.Since(startTime).Milliseconds()
+					span.SetAttributes(
+						attribute.Int("llm.chunk_count", chunkCount),
+						attribute.Int64("llm.total_bytes", totalBytes),
+						attribute.Int64("llm.latency_ms", latencyMs),
+					)
+					span.SetStatus(codes.Ok, "stream completed")
 					return // Stream finished
 				}
 
@@ -434,14 +578,21 @@ func (h *HuggingFaceAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan 
 				}
 
 				if parseErr != nil {
+					span.RecordError(parseErr)
+					span.SetStatus(codes.Error, "failed to parse chunk")
 					tokenChan <- Token{Error: parseErr}
 					return
 				}
 
 				if content != "" {
+					chunkCount++
+					totalBytes += int64(len(content))
+
 					select {
 					case tokenChan <- Token{Content: content}:
 					case <-ctx.Done():
+						span.RecordError(ctx.Err())
+						span.SetStatus(codes.Error, "context cancelled during streaming")
 						tokenChan <- Token{Error: ctx.Err()}
 						return
 					}
@@ -452,6 +603,8 @@ func (h *HuggingFaceAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan 
 		// Check for scanner errors
 		if err := scanner.Err(); err != nil {
 			if ctx.Err() == nil {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, "stream read error")
 				tokenChan <- Token{Error: fmt.Errorf("stream read error: %w", err)}
 			}
 		}

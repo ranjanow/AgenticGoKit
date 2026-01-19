@@ -12,6 +12,11 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/agenticgokit/agenticgokit/internal/observability"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 // OllamaAdapter implements the LLMAdapter interface for Ollama's API.
@@ -63,12 +68,21 @@ func (o *OllamaAdapter) SetEmbeddingModel(model string) {
 
 // Call implements the ModelProvider interface for a single request/response.
 func (o *OllamaAdapter) Call(ctx context.Context, prompt Prompt) (Response, error) {
+	// Create observability span
+	tracer := otel.Tracer("agenticgokit.llm")
+	ctx, span := tracer.Start(ctx, "llm.ollama.call")
+	defer span.End()
+
 	// Ensure HTTP client is initialized for tests that construct adapter directly
 	if o.httpClient == nil {
 		o.httpClient = NewOptimizedHTTPClient(120 * time.Second)
 	}
+
 	if prompt.System == "" && prompt.User == "" {
-		return Response{}, errors.New("both system and user prompts cannot be empty")
+		err := errors.New("both system and user prompts cannot be empty")
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "empty prompts")
+		return Response{}, err
 	}
 
 	// Determine final parameters, preferring explicit prompt settings
@@ -86,6 +100,17 @@ func (o *OllamaAdapter) Call(ctx context.Context, prompt Prompt) (Response, erro
 		finalTemperature = o.temperature
 	}
 
+	// Set span attributes
+	span.SetAttributes(
+		attribute.String(observability.AttrLLMProvider, "ollama"),
+		attribute.String(observability.AttrLLMModel, o.model),
+		attribute.Int(observability.AttrLLMMaxTokens, finalMaxTokens),
+		attribute.Float64(observability.AttrLLMTemperature, float64(finalTemperature)),
+	)
+
+	// Track start time for latency
+	startTime := time.Now()
+
 	// Build messages array
 	messages := []map[string]interface{}{}
 	if prompt.System != "" {
@@ -96,6 +121,10 @@ func (o *OllamaAdapter) Call(ctx context.Context, prompt Prompt) (Response, erro
 
 	// Add images if present
 	if len(prompt.Images) > 0 {
+		span.SetAttributes(
+			attribute.Bool("llm.multimodal", true),
+			attribute.Int("llm.image_count", len(prompt.Images)),
+		)
 		images := []string{}
 		for _, img := range prompt.Images {
 			// Ollama expects base64 strings
@@ -156,6 +185,7 @@ func (o *OllamaAdapter) Call(ctx context.Context, prompt Prompt) (Response, erro
 
 	// Include native tools if provided
 	if len(prompt.Tools) > 0 {
+		span.SetAttributes(attribute.Int("llm.tool_count", len(prompt.Tools)))
 		tools := make([]map[string]interface{}, len(prompt.Tools))
 		for i, tool := range prompt.Tools {
 			tools[i] = map[string]interface{}{
@@ -170,23 +200,35 @@ func (o *OllamaAdapter) Call(ctx context.Context, prompt Prompt) (Response, erro
 
 	payload, err := json.Marshal(requestBody)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to marshal request")
 		return Response{}, fmt.Errorf("failed to marshal request body: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("%s/api/chat", o.baseURL), bytes.NewBuffer(payload))
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to create HTTP request")
 		return Response{}, fmt.Errorf("failed to create HTTP request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := o.httpClient.Do(req)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "HTTP request failed")
 		return Response{}, fmt.Errorf("HTTP request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
+	// Record HTTP status
+	span.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return Response{}, fmt.Errorf("Ollama API error: %s", string(body))
+		err := fmt.Errorf("Ollama API error: %s", string(body))
+		span.RecordError(err)
+		span.SetStatus(codes.Error, fmt.Sprintf("API error: status %d", resp.StatusCode))
+		return Response{}, err
 	}
 
 	var apiResp struct {
@@ -201,14 +243,21 @@ func (o *OllamaAdapter) Call(ctx context.Context, prompt Prompt) (Response, erro
 		} `json:"message"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to decode response")
 		return Response{}, fmt.Errorf("failed to decode response: %w", err)
 	}
+
+	// Calculate latency
+	latencyMs := time.Since(startTime).Milliseconds()
+	span.SetAttributes(attribute.Int64("llm.latency_ms", latencyMs))
 
 	response := Response{
 		Content: apiResp.Message.Content,
 	}
 
 	if len(apiResp.Message.ToolCalls) > 0 {
+		span.SetAttributes(attribute.Int("llm.tool_calls_count", len(apiResp.Message.ToolCalls)))
 		response.ToolCalls = make([]ToolCallResponse, len(apiResp.Message.ToolCalls))
 		for i, tc := range apiResp.Message.ToolCalls {
 			response.ToolCalls[i] = ToolCallResponse{
@@ -221,15 +270,34 @@ func (o *OllamaAdapter) Call(ctx context.Context, prompt Prompt) (Response, erro
 		}
 	}
 
+	span.SetStatus(codes.Ok, "LLM call successful")
 	return response, nil
 }
 
 // Stream implements the ModelProvider interface for streaming responses.
 func (o *OllamaAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan Token, error) {
+	// Create observability span
+	tracer := otel.Tracer("agenticgokit.llm")
+	ctx, span := tracer.Start(ctx, "llm.ollama.stream")
+	defer span.End()
+
 	// Ensure HTTP client is initialized for tests that construct adapter directly
 	if o.httpClient == nil {
 		o.httpClient = NewOptimizedHTTPClient(120 * time.Second)
 	}
+
+	// Set span attributes
+	span.SetAttributes(
+		attribute.String(observability.AttrLLMProvider, "ollama"),
+		attribute.String(observability.AttrLLMModel, o.model),
+		attribute.Int(observability.AttrLLMMaxTokens, o.maxTokens),
+		attribute.Float64(observability.AttrLLMTemperature, float64(o.temperature)),
+		attribute.Bool("llm.streaming", true),
+	)
+
+	// Track start time for latency
+	startTime := time.Now()
+
 	// Create the request payload for Ollama streaming API
 	payload := map[string]interface{}{
 		"model":  o.model,
@@ -243,6 +311,10 @@ func (o *OllamaAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan Token
 
 	// Add images if present
 	if len(prompt.Images) > 0 {
+		span.SetAttributes(
+			attribute.Bool("llm.multimodal", true),
+			attribute.Int("llm.image_count", len(prompt.Images)),
+		)
 		images := []string{}
 		for _, img := range prompt.Images {
 			if img.Base64 != "" {
@@ -291,19 +363,25 @@ func (o *OllamaAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan Token
 	// Apply prompt parameters if provided
 	if prompt.Parameters.Temperature != nil {
 		payload["options"].(map[string]interface{})["temperature"] = *prompt.Parameters.Temperature
+		span.SetAttributes(attribute.Float64(observability.AttrLLMTemperature, float64(*prompt.Parameters.Temperature)))
 	}
 	if prompt.Parameters.MaxTokens != nil {
 		payload["options"].(map[string]interface{})["num_predict"] = *prompt.Parameters.MaxTokens
+		span.SetAttributes(attribute.Int(observability.AttrLLMMaxTokens, int(*prompt.Parameters.MaxTokens)))
 	}
 
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to marshal request")
 		return nil, fmt.Errorf("failed to marshal request payload: %w", err)
 	}
 
 	// Create HTTP request for streaming
 	req, err := http.NewRequestWithContext(ctx, "POST", o.baseURL+"/api/generate", bytes.NewReader(payloadBytes))
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to create HTTP request")
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -311,12 +389,20 @@ func (o *OllamaAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan Token
 	// Make the request
 	resp, err := o.httpClient.Do(req)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "HTTP request failed")
 		return nil, fmt.Errorf("failed to make request: %w", err)
 	}
 
+	// Record HTTP status
+	span.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
+
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		return nil, fmt.Errorf("HTTP error: %d", resp.StatusCode)
+		err := fmt.Errorf("HTTP error: %d", resp.StatusCode)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, fmt.Sprintf("HTTP error: %d", resp.StatusCode))
+		return nil, err
 	}
 
 	// Create token channel
@@ -327,12 +413,18 @@ func (o *OllamaAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan Token
 		defer close(tokenChan)
 		defer resp.Body.Close()
 
+		// Track chunks and total bytes
+		chunkCount := 0
+		totalBytes := 0
+
 		decoder := json.NewDecoder(resp.Body)
 
 		for {
 			select {
 			case <-ctx.Done():
 				tokenChan <- Token{Error: ctx.Err()}
+				span.RecordError(ctx.Err())
+				span.SetStatus(codes.Error, "context canceled during stream")
 				return
 			default:
 			}
@@ -345,22 +437,45 @@ func (o *OllamaAdapter) Stream(ctx context.Context, prompt Prompt) (<-chan Token
 
 			if err := decoder.Decode(&response); err != nil {
 				if err == io.EOF {
+					// Record final metrics
+					latencyMs := time.Since(startTime).Milliseconds()
+					span.SetAttributes(
+						attribute.Int("llm.stream.chunk_count", chunkCount),
+						attribute.Int("llm.stream.total_bytes", totalBytes),
+						attribute.Int64("llm.latency_ms", latencyMs),
+					)
+					span.SetStatus(codes.Ok, "stream completed successfully")
 					return // End of stream
 				}
 				tokenChan <- Token{Error: fmt.Errorf("failed to decode response: %w", err)}
+				span.RecordError(err)
+				span.SetStatus(codes.Error, "failed to decode stream response")
 				return
 			}
 
 			if response.Error != "" {
-				tokenChan <- Token{Error: fmt.Errorf("ollama error: %s", response.Error)}
+				err := fmt.Errorf("ollama error: %s", response.Error)
+				tokenChan <- Token{Error: err}
+				span.RecordError(err)
+				span.SetStatus(codes.Error, "ollama API error")
 				return
 			}
 
 			if response.Response != "" {
+				chunkCount++
+				totalBytes += len(response.Response)
 				tokenChan <- Token{Content: response.Response}
 			}
 
 			if response.Done {
+				// Record final metrics
+				latencyMs := time.Since(startTime).Milliseconds()
+				span.SetAttributes(
+					attribute.Int("llm.stream.chunk_count", chunkCount),
+					attribute.Int("llm.stream.total_bytes", totalBytes),
+					attribute.Int64("llm.latency_ms", latencyMs),
+				)
+				span.SetStatus(codes.Ok, "stream completed successfully")
 				return // Stream complete
 			}
 		}

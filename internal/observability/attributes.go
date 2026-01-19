@@ -9,15 +9,18 @@ const (
 	AttrSystemPromptHash = "agk.agent.system_prompt_hash"
 
 	// LLM attributes
-	AttrLLMProvider    = "agk.llm.provider"
-	AttrLLMModel       = "agk.llm.model"
-	AttrLLMTemperature = "agk.llm.temperature"
-	AttrLLMMaxTokens   = "agk.llm.max_tokens"
-	AttrLLMTokensIn    = "agk.llm.tokens.input"
-	AttrLLMTokensOut   = "agk.llm.tokens.output"
-	AttrLLMCostUSD     = "agk.llm.cost.usd"
-	AttrLLMRetryCount  = "agk.llm.retry_count"
-	AttrLLMLatencyMs   = "agk.llm.latency_ms"
+	AttrLLMProvider         = "agk.llm.provider"
+	AttrLLMModel            = "agk.llm.model"
+	AttrLLMTemperature      = "agk.llm.temperature"
+	AttrLLMMaxTokens        = "agk.llm.max_tokens"
+	AttrLLMTokensIn         = "agk.llm.tokens.input"
+	AttrLLMTokensOut        = "agk.llm.tokens.output"
+	AttrLLMPromptTokens     = "agk.llm.tokens.prompt"
+	AttrLLMCompletionTokens = "agk.llm.tokens.completion"
+	AttrLLMTotalTokens      = "agk.llm.tokens.total"
+	AttrLLMCostUSD          = "agk.llm.cost.usd"
+	AttrLLMRetryCount       = "agk.llm.retry_count"
+	AttrLLMLatencyMs        = "agk.llm.latency_ms"
 
 	// Tool attributes
 	AttrToolName      = "agk.tool.name"
