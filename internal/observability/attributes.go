@@ -27,6 +27,20 @@ const (
 	AttrToolLatencyMs = "agk.tool.latency_ms"
 	AttrMCPServer     = "agk.mcp.server"
 
+	// Workflow attributes
+	AttrWorkflowID             = "agk.workflow.id"
+	AttrWorkflowMode           = "agk.workflow.mode"
+	AttrWorkflowStepCount      = "agk.workflow.step_count"
+	AttrWorkflowStepName       = "agk.workflow.step_name"
+	AttrWorkflowStepIndex      = "agk.workflow.step_index"
+	AttrWorkflowInputBytes     = "agk.workflow.input_bytes"
+	AttrWorkflowOutputBytes    = "agk.workflow.output_bytes"
+	AttrWorkflowLatencyMs      = "agk.workflow.latency_ms"
+	AttrWorkflowSuccess        = "agk.workflow.success"
+	AttrWorkflowTokensUsed     = "agk.workflow.tokens_used"
+	AttrWorkflowTimeout        = "agk.workflow.timeout_seconds"
+	AttrWorkflowCompletedSteps = "agk.workflow.completed_steps"
+
 	// Memory attributes
 	AttrMemoryOperation = "agk.memory.operation"
 	AttrMemorySize      = "agk.memory.size_bytes"

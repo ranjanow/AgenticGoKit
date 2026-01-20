@@ -8,6 +8,11 @@ import (
 	"io"
 	"sync"
 	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // =============================================================================
@@ -91,6 +96,17 @@ func (wa *SubWorkflowAgent) Run(ctx context.Context, input string) (*Result, err
 
 // RunWithOptions implements Agent.RunWithOptions
 func (wa *SubWorkflowAgent) RunWithOptions(ctx context.Context, input string, runOpts *RunOptions) (*Result, error) {
+	tracer := otel.Tracer("agenticgokit")
+	executionStartTime := time.Now()
+	ctx, span := tracer.Start(ctx, "agk.subworkflow.run",
+		trace.WithAttributes(
+			attribute.String("agk.subworkflow.name", wa.name),
+			attribute.String("agk.subworkflow.path", wa.getFullPath()),
+			attribute.Int("agk.subworkflow.depth", wa.depth),
+			attribute.String("agk.subworkflow.workflow_mode", string(wa.workflow.GetConfig().Mode)),
+		))
+	defer span.End()
+
 	wa.mu.Lock()
 	wa.execCount++
 	wa.mu.Unlock()
@@ -99,8 +115,11 @@ func (wa *SubWorkflowAgent) RunWithOptions(ctx context.Context, input string, ru
 
 	// Check nesting depth for safety
 	if wa.depth > 0 && wa.depth >= wa.maxDepth {
-		return nil, fmt.Errorf("maximum workflow nesting depth (%d) exceeded at %s",
+		err := fmt.Errorf("maximum workflow nesting depth (%d) exceeded at %s",
 			wa.maxDepth, wa.getFullPath())
+		span.SetStatus(codes.Error, "max nesting depth exceeded")
+		span.RecordError(err)
+		return nil, err
 	}
 
 	// Apply timeout from RunOptions if specified
@@ -108,10 +127,15 @@ func (wa *SubWorkflowAgent) RunWithOptions(ctx context.Context, input string, ru
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, runOpts.Timeout)
 		defer cancel()
+		span.SetAttributes(attribute.Int64("agk.subworkflow.timeout_ms", runOpts.Timeout.Milliseconds()))
 	}
 
 	// Add workflow metadata to context for tracing
 	ctx = wa.enrichContext(ctx)
+
+	// Record input size
+	inputSize := len(input)
+	span.SetAttributes(attribute.Int("agk.subworkflow.input_bytes", inputSize))
 
 	// Execute the wrapped workflow
 	workflowResult, err := wa.workflow.Run(ctx, input)
@@ -121,7 +145,23 @@ func (wa *SubWorkflowAgent) RunWithOptions(ctx context.Context, input string, ru
 	wa.totalDuration += duration
 	wa.mu.Unlock()
 
+	// Record execution metrics
+	outputSize := 0
+	if workflowResult != nil {
+		outputSize = len(workflowResult.FinalOutput)
+	}
+
+	span.SetAttributes(
+		attribute.Int("agk.subworkflow.output_bytes", outputSize),
+		attribute.Int64("agk.subworkflow.latency_ms", duration.Milliseconds()),
+		attribute.Bool("agk.subworkflow.success", err == nil),
+		attribute.Int("agk.subworkflow.total_tokens", workflowResult.TotalTokens),
+		attribute.Int("agk.subworkflow.steps_executed", len(workflowResult.StepResults)),
+	)
+
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
+		span.RecordError(err)
 		return &Result{
 			Success:  false,
 			Error:    fmt.Sprintf("subworkflow %s failed: %v", wa.name, err),
@@ -130,20 +170,42 @@ func (wa *SubWorkflowAgent) RunWithOptions(ctx context.Context, input string, ru
 		}, err
 	}
 
+	// Record execution completion
+	overallDuration := time.Since(executionStartTime)
+	span.SetAttributes(
+		attribute.Int64("agk.subworkflow.total_duration_ms", overallDuration.Milliseconds()),
+	)
+	span.SetStatus(codes.Ok, "success")
+
 	// Convert WorkflowResult to Agent Result
 	return wa.convertToResult(workflowResult, duration), nil
 }
 
 // RunStream implements Agent.RunStream by streaming the wrapped workflow
 func (wa *SubWorkflowAgent) RunStream(ctx context.Context, input string, opts ...StreamOption) (Stream, error) {
+	tracer := otel.Tracer("agenticgokit")
+	executionStartTime := time.Now()
+	ctx, span := tracer.Start(ctx, "agk.subworkflow.stream",
+		trace.WithAttributes(
+			attribute.String("agk.subworkflow.name", wa.name),
+			attribute.String("agk.subworkflow.path", wa.getFullPath()),
+			attribute.Int("agk.subworkflow.depth", wa.depth),
+			attribute.String("agk.subworkflow.workflow_mode", string(wa.workflow.GetConfig().Mode)),
+			attribute.Int("agk.subworkflow.input_bytes", len(input)),
+		))
+
 	wa.mu.Lock()
 	wa.execCount++
 	wa.mu.Unlock()
 
 	// Check nesting depth for safety
 	if wa.depth > 0 && wa.depth >= wa.maxDepth {
-		return nil, fmt.Errorf("maximum workflow nesting depth (%d) exceeded at %s",
+		err := fmt.Errorf("maximum workflow nesting depth (%d) exceeded at %s",
 			wa.maxDepth, wa.getFullPath())
+		span.SetStatus(codes.Error, "max nesting depth exceeded")
+		span.RecordError(err)
+		span.End()
+		return nil, err
 	}
 
 	// Add workflow metadata to context for tracing
@@ -152,11 +214,15 @@ func (wa *SubWorkflowAgent) RunStream(ctx context.Context, input string, opts ..
 	// Create wrapper stream that adds subworkflow metadata
 	stream, err := wa.workflow.RunStream(ctx, input, opts...)
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
+		span.RecordError(err)
+		span.End()
 		return nil, fmt.Errorf("subworkflow %s streaming failed: %w", wa.name, err)
 	}
 
-	// Wrap stream to inject metadata
-	return wa.wrapStream(stream), nil
+	// Wrap stream to inject metadata and observability
+	wrappedStream := wa.wrapStreamWithObservability(stream, span, executionStartTime)
+	return wrappedStream, nil
 }
 
 // RunStreamWithOptions implements Agent.RunStreamWithOptions
@@ -278,6 +344,30 @@ func (wa *SubWorkflowAgent) enrichContext(ctx context.Context) context.Context {
 	ctx = context.WithValue(ctx, workflowDepthKey, wa.depth)
 
 	return ctx
+}
+
+// wrapStreamWithObservability wraps a stream to add both metadata and observability tracing
+func (wa *SubWorkflowAgent) wrapStreamWithObservability(stream Stream, parentSpan trace.Span, startTime time.Time) Stream {
+	// Add subworkflow metadata to stream metadata
+	metadata := stream.Metadata()
+	if metadata.Extra == nil {
+		metadata.Extra = make(map[string]interface{})
+	}
+	metadata.Extra["subworkflow_name"] = wa.name
+	metadata.Extra["subworkflow_path"] = wa.getFullPath()
+	metadata.Extra["subworkflow_depth"] = wa.depth
+
+	// Create wrapped stream that intercepts chunks and adds subworkflow context + observability
+	return &wrappedSubworkflowStreamWithObservability{
+		inner:            stream,
+		subworkflowName:  wa.name,
+		subworkflowPath:  wa.getFullPath(),
+		subworkflowDepth: wa.depth,
+		parentSpan:       parentSpan,
+		startTime:        startTime,
+		outputBytes:      0,
+		chunkCount:       0,
+	}
 }
 
 // wrapStream wraps a stream to add subworkflow metadata to chunks
@@ -478,4 +568,101 @@ func NewLoopSubWorkflow(name string, config *WorkflowConfig) (Agent, error) {
 		return nil, err
 	}
 	return NewSubWorkflowAgent(name, workflow), nil
+}
+
+// =============================================================================
+// OBSERVABILITY-AWARE STREAM WRAPPER
+// =============================================================================
+
+// wrappedSubworkflowStreamWithObservability wraps a subworkflow stream with observability tracing
+type wrappedSubworkflowStreamWithObservability struct {
+	inner              Stream
+	subworkflowName    string
+	subworkflowPath    string
+	subworkflowDepth   int
+	parentSpan         trace.Span
+	startTime          time.Time
+	outputBytes        int
+	chunkCount         int
+	streamFinalized    bool
+	streamFinalizeOnce sync.Once
+}
+
+// Chunks returns the channel for receiving stream chunks with observability tracing
+func (ws *wrappedSubworkflowStreamWithObservability) Chunks() <-chan *StreamChunk {
+	outChan := make(chan *StreamChunk, 100)
+
+	go func() {
+		defer close(outChan)
+		defer ws.finalizeStream()
+
+		for chunk := range ws.inner.Chunks() {
+			ws.chunkCount++
+
+			// Record chunk emission
+			if chunk != nil {
+				// Track output size
+				if chunk.Type == ChunkTypeText {
+					ws.outputBytes += len(chunk.Content)
+				}
+
+				// Enrich chunk metadata with subworkflow context
+				if chunk.Metadata == nil {
+					chunk.Metadata = make(map[string]interface{})
+				}
+
+				// Add parent subworkflow context
+				chunk.Metadata["parent_subworkflow"] = ws.subworkflowName
+				chunk.Metadata["subworkflow_path"] = ws.subworkflowPath
+				chunk.Metadata["subworkflow_depth"] = ws.subworkflowDepth
+			}
+
+			outChan <- chunk
+		}
+	}()
+
+	return outChan
+}
+
+// Metadata returns the stream metadata
+func (ws *wrappedSubworkflowStreamWithObservability) Metadata() *StreamMetadata {
+	return ws.inner.Metadata()
+}
+
+// Wait waits for stream completion and finalizes observability
+func (ws *wrappedSubworkflowStreamWithObservability) Wait() (*Result, error) {
+	result, err := ws.inner.Wait()
+	ws.finalizeStream()
+	return result, err
+}
+
+// Cancel cancels the underlying stream
+func (ws *wrappedSubworkflowStreamWithObservability) Cancel() {
+	ws.inner.Cancel()
+	ws.finalizeStream()
+}
+
+// AsReader returns an io.Reader for the stream content
+func (ws *wrappedSubworkflowStreamWithObservability) AsReader() io.Reader {
+	return ws.inner.AsReader()
+}
+
+// finalizeStream records observability metrics when stream completes
+func (ws *wrappedSubworkflowStreamWithObservability) finalizeStream() {
+	ws.streamFinalizeOnce.Do(func() {
+		if ws.streamFinalized {
+			return
+		}
+		ws.streamFinalized = true
+
+		// Record final stream metrics
+		duration := time.Since(ws.startTime)
+		ws.parentSpan.SetAttributes(
+			attribute.Int("agk.subworkflow.output_bytes", ws.outputBytes),
+			attribute.Int("agk.subworkflow.stream_chunks", ws.chunkCount),
+			attribute.Int64("agk.subworkflow.stream_duration_ms", duration.Milliseconds()),
+		)
+		ws.parentSpan.SetStatus(codes.Ok, "stream completed")
+		ws.parentSpan.End()
+	})
 }
